@@ -1,0 +1,19 @@
+version: "3.9"  # Docker Compose file format version
+
+services:
+  pytorch-xpu:
+    image: intel/intel-extension-for-pytorch:2.3.110-xpu-pip-jupyter
+    container_name: pytorch_xpu
+    ports:
+      - "8888:8888"  # Map port 6000 for Jupyter Notebook
+    devices:
+      - "/dev/dri:/dev/dri"  # Access GPU devices
+    volumes:
+      - /dev/dri/by-path:/dev/dri/by-path
+      - ./shared:/jupyter/shared
+      - ./datasets:/jupyter/datasets
+    entrypoint: >
+      sh -c "
+      pip install pandas numpy nfstream torchvision seaborn scikit-learn &&
+      jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root"
+
