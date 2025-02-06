@@ -38,35 +38,25 @@ class TimestampsToLog(BaseEstimator, TransformerMixin):
             X_tmp[column] = X_tmp[column].apply(lambda x: 1 if x ==1 else (-1 if x ==0 else np.log(x).astype(float)))
         return X_tmp
 
-# Configurations:
-# Detect attack/vuln only
-# Sensitivity level
-# Report susp packets
-# Log file path
-
-
-
-#%%
-torch.serialization.add_safe_globals([LSTMAutoEncoder, Encoder, Decoder])
-torch.serialization.safe_globals([LSTMAutoEncoder, Encoder, Decoder])
-        
 #%%
 
 
 class CommunicationAnalyzer:
-    def __init__(self, attacks_labels, vuln_labels, error_threashold, log_path = 'log.txt', report_susp_flows=True):
+    def __init__(self, attacks_labels, vuln_labels, error_threashold = 5, config, notifiers = []):
         self.attacks_label_map = {value: key for key, value in attacks_labels.items()}
         self.vuln_label_map = {value: key for key, value in vuln_labels.items()}
         self.error_threashold = error_threashold
-        self.log_path = log_path
+        self.notifiers = notifiers
+        self.error_log_path = config.get('error_log_path', 'logs/error.log')
+        self.report_susp_flows = config.get('report_susp_flows', True)
         self.setup()
     def setup(self):
-        self.ae_pipeline = joblib.load('/home/grauzone/projects/bakalarka/code/shared/models/ae_pipeline_final.gz')
-        self.attack_scaler = joblib.load('/home/grauzone/projects/bakalarka/code/shared/models/att_scaler_final.gz')
-        self.attack_classifier = torch.load('/home/grauzone/projects/bakalarka/code/shared/models/attack_final.pth', map_location='cpu', weights_only=False)
-        self.vuln_pipeline = joblib.load('/home/grauzone/projects/bakalarka/code/shared/models/vuln_pipeline.gz')
-        self.vuln_classifier = joblib.load('/home/grauzone/projects/bakalarka/code/shared/models/vuln_classifier.gz')
-        self.ae = torch.load('/home/grauzone/projects/bakalarka/code/shared/models/ae_final.pth', map_location='cpu', weights_only=False)
+        self.ae_pipeline = joblib.load('models/ae_pipeline_final.gz')
+        self.attack_scaler = joblib.load('models/att_scaler_final.gz')
+        self.attack_classifier = torch.load('models/attack_final.pth', map_location='cpu', weights_only=False)
+        self.vuln_pipeline = joblib.load('models/vuln_pipeline.gz')
+        self.vuln_classifier = joblib.load('models/vuln_classifier.gz')
+        self.ae = torch.load('models/ae_final.pth', map_location='cpu', weights_only=False)
         self.ae.device = torch.device("cpu")
         self.ae.encoder.device = torch.device("cpu")
         self.ae.decoder.device = torch.device("cpu")
@@ -95,9 +85,15 @@ class CommunicationAnalyzer:
         data, encodings, packets, columns = self.preprocess(flow)
         ae_predictions, transformed, ae_score = self.get_ae_results(data)
         if (ae_score > self.error_threashold):
-            attack_labels = self.get_attack_prediction(packets)
+            attack_label = self.get_attack_prediction(packets)
             vuln_labels = self.get_vuln_prediction(encodings)
-            self.log_report(flow, ae_score, attack_labels, vuln_labels, encodings)
+            if attack_label != 'BENIGN':
+                self.log_report(flow, ae_score, 'attack', attack_label, encodings)
+            elif any(item != 'BENIGN' for item in vuln_labels):
+                self.log_report(flow, ae_score, 'vulnerability', vuln_labels, encodings)
+            else:
+                if self.report_susp_flows:
+                    self.log_report(flow, ae_score, 'mixed', 'Suspicious flow', encodings)
     def get_ae_results(self, data):
         transformed = self.ae_pipeline.transform(data)             
         transformed = torch.tensor(np.array(transformed)).unsqueeze(1)
@@ -107,24 +103,32 @@ class CommunicationAnalyzer:
     def get_attack_prediction(self, packets):
         packets = self.attack_scaler.transform(np.array(packets))
         oh_predictions = self.attack_classifier(torch.tensor(packets, dtype=torch.float32).unsqueeze(0))
-        return self.get_labels(torch.argmax(oh_predictions).item(), True)
+        return self.get_labels(torch.argmax(oh_predictions).item(), attack=True)
     def get_vuln_prediction(self, encodings):
         vulnerabilities = self.vuln_pipeline.predict(encodings) if len(encodings) else [1]
-        return self.get_labels(vulnerabilities, False)
-    def log_report(self, flow, ae_score, attack, vulnerability, encodings):
-        attack_str = ', '.join(attack)
-        vuln_str = ', '.join(vulnerability)
-        with open(self.log_path, 'a') as file:
-            file.write('======\n')
-            file.write(f'Suspicious flow detected on port {flow.src_port}, error: {ae_score}\n')
-            file.write(f'Attacks: {attack_str}\n')
-            file.write(f'Vulnerabilities: {vuln_str}\n')
-            file.write(f'Payloads: {encodings}')
-            file.write('======\n')
+        return self.get_labels(np.unique(vulnerabilities), attack=False)
+    def log_report(self, flow, ae_score, event_type, event_name, encodings):
+        event = {
+            'flow': flow,
+            'score': ae_score,
+            'type': event_type,
+            'name': event_name,
+            'payloads': encodings
+        }
+        for notifier in self.notifiers:
+            try:
+                notifier.notify(event)  
+            except Exception as e:
+                self.log_error(error=e)
+    def log_error(self, error):
+        with open(self.error_log_path, 'a') as file:
+            file.write(str(error))
+                
+      
+        
 #%%
 import collections
 import array
-import pandas as pd
             
 class PayloadCollector(NFPlugin):
     def __init__(self, packet_limit = 15):
@@ -159,6 +163,60 @@ class PayloadCollector(NFPlugin):
             for i in range(diff):
                 distro = [0 for i in range(256)]
                 flow.udps.packets.append(distro)
+                
+#%%
+import requests
+import json
+import urllib
+
+class SplunkNotificator:
+    def __init__(self, url, token):
+        self.url = url
+        self.token = token
+    def get_body(self, event):
+        flow = event['flow']
+        data = {
+            "event": {
+                "type": str(event['type']),
+                "name": str(event['name']),
+                "score": str(event['score']),
+                "src_ip": flow.src_ip,
+                "dst_ip": flow.dst_ip,
+                "src_port": flow.src_port,
+                "dst_port": flow.dst_port,
+                "payload": str(event['payloads'])
+            },
+            "sourcetype": "analyzer"
+        }
+        return json.dumps(data)
+    def notify(self, event):
+        body = self.get_body(event)
+        headers = {
+            'Authorization': 'Splunk ' + self.token    
+        }
+        response = requests.post(self.url, headers = headers, data = body)
+        if response.status_code != 200:
+            print(f"Sending to Splunk failed with status code: {response.status_code}")
+            print("Response text:", response.text)
+            raise urllib.error.HTTPError(response.text)
+            
+#%%
+class LogNotificator:
+    def __init__(self, path):
+        self.path = path
+    def get_body(self, event):
+        flow = event['flow']
+        body = ''
+        body = body + ('======\n')
+        body = body +(f'Suspicious flow detected on port {flow.src_port}, error: ' + str(event['score']) + '\n')
+        body = body +(str(event['type']) + ': ' + str(event['name']) + ' \n')
+        body = body +('======\n')
+        return body
+    def notify(self, event):
+        # print(event)
+        body = self.get_body(event)
+        with open(self.path, 'a') as file:
+            file.write(str(body))
 #%%
 import configparser
 import os
@@ -186,8 +244,12 @@ class UserCommunicator:
             'PORTSCAN': 4
         }
         self.config_file = 'config.cfg'
-        self.required_config_fields = ['sensitivity', 'interface', 'log_path', 'report_susp_flows', 'idle_timeout']
+        self.required_config_fields = ['interface']
+        self.splunk_fields = ['enable', 'url', 'token']
+        self.logger_fields = ['enable', 'path']
+        self.notifiers = []
         self.set_config()
+        self.set_notifiers()
         self.set_analyzer()
     def set_config(self):
         config = configparser.RawConfigParser()
@@ -198,16 +260,35 @@ class UserCommunicator:
 
         config.read(self.config_file)
             
-        self.details_dict = dict(config.items('ANALYZER'))
+        self.analyzer_dict = dict(config.items('ANALYZER'))
+        self.splunk_dict = dict(config.items('SPLUNK'))
+        self.logger_dict = dict(config.items('LOGGER'))
+
         for field in self.required_config_fields:
-            if not field in self.details_dict:
-                print(f'Field {field} is not set in config! Please check your file and try again')
+            if not field in self.analyzer_dict:
+                print(f'Field {field} is not set in ANALYZER config! Please check your file and try again')
                 sys.exit(1)
+    def set_notifiers(self):
+        if 'enable' in self.splunk_dict and self.splunk_dict['enable']:
+            for field in self.splunk_fields:
+                if not field in self.splunk_dict:
+                    print(f'Field {field} is not set in SPLUNK config! Please check your file and try again')
+                    sys.exit(1)
+            self.notifiers.append(SplunkNotificator(self.splunk_dict['url'], self.splunk_dict['token']))
+        if 'enable' in self.logger_dict and self.logger_dict['enable']:
+            for field in self.logger_fields:
+                if not field in self.logger_dict:
+                    print(f'Field {field} is not set in LOGGER config! Please check your file and try again')
+                    sys.exit(1)
+            self.notifiers.append(LogNotificator(self.logger_dict['path']))
+    def get_sensitivity():
+        sensitivity = self.analyzer_dict.get('sensitivity', 'middle')
+        return self.sensitivity_map.get(sensitivity, 0.12)
     def set_analyzer(self):
-        self.analyzer = CommunicationAnalyzer(self.attacks, self.vulnerabilities, self.sensitivity_map[self.details_dict['sensitivity']], self.details_dict['log_path'], self.details_dict['report_susp_flows'])
+        self.analyzer = CommunicationAnalyzer(self.attacks, self.vulnerabilities, self.get_sensitivity(), self.analyzer_dict, self.notifiers, )
     def analyze(self):
         print('Starting listening ...')
-        streamer = NFStreamer(source=self.details_dict['interface'], statistical_analysis=True, udps=PayloadCollector(), idle_timeout=int(self.details_dict['idle_timeout']))
+        streamer = NFStreamer(source=self.analyzer_dict['interface'], statistical_analysis=True, udps=PayloadCollector(), idle_timeout=int(self.analyzer_dict['idle_timeout']))
         for flow in streamer:
             self.analyzer.analyze(flow)
         
